@@ -130,6 +130,51 @@ MiniElixir.eval(code, module, function, args, opts \\ [persistent: true]) :: {:o
 - `{:ok, result}` on success
 - `{:error, reason}` on failure
 
+### `MiniElixir.compile/2`
+
+Validates and compiles a module without executing any of it. Use this when you want to compile once and call the functions later with `apply/3` (for example from a serialising process), rather than compiling and running in one step.
+
+```elixir
+MiniElixir.compile(code, as: Outer, inner: Transformer) :: {:ok, module} | {:error, reason}
+```
+
+```elixir
+code = """
+defmodule Transform do
+  def request(record, metadata) do
+    tag(record, metadata)
+  end
+
+  defp tag(record, nil), do: record
+  defp tag(record, metadata), do: Map.put(record, "tag", metadata)
+end
+"""
+
+{:ok, Transform199.Transformer} = MiniElixir.compile(code, as: Transform199)
+apply(Transform199.Transformer, :request, [%{}, "x"])
+# => %{"tag" => "x"}
+```
+
+#### Parameters
+
+- `code` (string): Elixir code string containing exactly one top-level module definition
+- `opts` (keyword): Options
+  - `:as` (atom, required): the outer module name, e.g. `Transform199`
+  - `:inner` (atom, default: `Transformer`): the inner module name. The source module is renamed to this, so `defmodule Transform do` and `defmodule Anything do` both compile to `Transform199.Transformer`
+
+#### Behaviour
+
+- Every `def` and `defp` clause is validated, including multi-clause heads, `when` guards and default-argument expressions. `eval/5` applies the same whole-module validation.
+- Only `@doc`, `@moduledoc`, `@typedoc`, `@spec` and `@type` are accepted as module attributes. Doc attributes must be literal values; typespecs may not contain `unquote`. Attributes such as `@on_load`, `@before_compile` and `@after_compile` are rejected because they run code at compile time.
+- Function clauses may only have a `do` block (no `rescue`, `catch` or `after`).
+- The outer wrapper is built as AST around the validated inner module, so source containing a stray `end` or trailing top-level code fails at parse or structure check and defines nothing.
+- Nothing is applied. The returned module is loaded and ready for `apply/3`. Compiling again under the same `as:` replaces the previous version.
+
+#### Returns
+
+- `{:ok, module}` where `module` is `Module.concat(as, inner)`
+- `{:error, reason}` with the same string shapes as `eval/5`: `"Line N: ..."` for parse errors, validator or structure messages otherwise
+
 ## Allowed vs Disallowed
 
 MiniElixir validates code before it is compiled/executed. Only a specific set of operators and modules are allowed. Anything not listed is rejected during validation.
