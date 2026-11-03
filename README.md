@@ -161,15 +161,14 @@ apply(MyApp.Transform, :request, [%{}, "x"])
 
 #### Behaviour
 
-- Every `def` and `defp` clause is validated, including multi-clause heads, `when` guards and default-argument expressions. `eval/5` applies the same whole-module validation.
-- Function clauses may only have a `do` block (no `rescue`, `catch` or `after`).
+- Every `def` and `defp` clause is validated with the same rules `eval/5` applies to the function it runs, including multi-clause heads, `when` guards and default-argument expressions. Function clauses may only have a `do` block (no `rescue`, `catch` or `after`).
 - Source containing a stray `end`, trailing top-level code, or more than one module fails at parse or structure check and defines nothing.
 - Nothing is applied. The returned module is loaded and ready for `apply/3`. Compiling again under the same name replaces the previous version.
 
 #### Returns
 
 - `{:ok, module}` where `module` is the name defined in the source
-- `{:error, reason}` with the same string shapes as `eval/5`: `"Line N: ..."` for parse errors, validator or structure messages otherwise
+- `{:error, reason}` where `reason` is a string: `"Line N: ..."` for parse errors, validator or structure messages otherwise
 
 ## Allowed vs Disallowed
 

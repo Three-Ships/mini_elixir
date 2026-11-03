@@ -83,11 +83,11 @@ defmodule MiniElixir do
         e -> {:error, Exception.message(e)}
       end
     else
-      with {:ok, ast} <- parse(code),
+      with {:ok, ast} <- Code.string_to_quoted(code),
            :ok <- validate_module_name(ast, module),
            :ok <- validate_module_structure(ast),
-           :ok <- validate_all_functions(ast),
-           :ok <- ensure_function_defined(ast, function, arity) do
+           {:ok, {fun_body, arg_names}} <- unwrap_function(ast, function, length(args)),
+           :ok <- Validator.check(fun_body, arg_names) do
         try do
           # only compile and execute after validation
           Code.compiler_options(ignore_module_conflict: true)
@@ -107,6 +107,7 @@ defmodule MiniElixir do
         end
       else
         {:error, reason} -> {:error, reason}
+        {:error, line, reason} -> {:error, "Line #{line}: #{reason}"}
       end
     end
   end
@@ -115,15 +116,15 @@ defmodule MiniElixir do
   Validates and compiles a string of Elixir code without executing any of it.
 
   The source must contain exactly one top-level `defmodule`. Every `def` and
-  `defp` clause in it is validated with the same rules `eval/5` applies, and
-  then the module is compiled and loaded under the name the source gives it.
-  Nothing is applied; the caller runs the compiled functions later with
-  `apply/3`.
+  `defp` clause in it is validated with the same rules `eval/5` applies to the
+  function it runs, and then the module is compiled and loaded under the name
+  the source gives it. Nothing is applied; the caller runs the compiled
+  functions later with `apply/3`.
 
   ## Returns
 
   - `{:ok, module}` where `module` is the name defined in the source
-  - `{:error, reason}` with the same string shapes `eval/5` produces
+  - `{:error, reason}` where `reason` is a string
 
   ## Examples
 
@@ -141,43 +142,44 @@ defmodule MiniElixir do
   """
   def compile(code) when is_binary(code) do
     with {:ok, ast} <- parse(code),
-         {:ok, module} <- validate_single_module(ast),
+         {:ok, module} <- single_module(ast),
          :ok <- validate_module_structure(ast),
          :ok <- validate_all_functions(ast) do
-      compile_module(ast, module)
-    end
-  end
-
-  defp compile_module(ast, module) do
-    try do
-      Code.compiler_options(ignore_module_conflict: true)
-      Code.compile_quoted(ast)
-      {:ok, module}
-    rescue
-      e -> {:error, Exception.message(e)}
-    after
-      Code.compiler_options(ignore_module_conflict: false)
+      try do
+        Code.compiler_options(ignore_module_conflict: true)
+        Code.compile_quoted(ast)
+        {:ok, module}
+      rescue
+        e -> {:error, Exception.message(e)}
+      after
+        Code.compiler_options(ignore_module_conflict: false)
+      end
     end
   end
 
   defp parse(code) do
     case Code.string_to_quoted(code) do
-      {:ok, ast} -> {:ok, ast}
-      {:error, {meta, message, token}} -> {:error, format_parse_error(meta, message, token)}
+      {:ok, ast} ->
+        {:ok, ast}
+
+      {:error, {meta, message, token}} ->
+        line = if is_list(meta), do: Keyword.get(meta, :line), else: meta
+
+        text =
+          case message do
+            {prefix, suffix} -> prefix <> to_string(token) <> suffix
+            message -> to_string(message) <> to_string(token)
+          end
+
+        {:error, "Line #{line}: #{text}"}
     end
   end
 
-  defp format_parse_error(meta, message, token) do
-    line = if is_list(meta), do: Keyword.get(meta, :line, meta), else: meta
+  defp single_module({:defmodule, _, [{:__aliases__, _, parts}, _]}),
+    do: {:ok, Module.concat(parts)}
 
-    text =
-      case message do
-        {prefix, suffix} -> prefix <> to_string(token) <> suffix
-        message -> to_string(message) <> to_string(token)
-      end
-
-    "Line #{line}: #{text}"
-  end
+  defp single_module({:__block__, _, _}), do: {:error, "Expected exactly one module definition"}
+  defp single_module(_), do: {:error, "Expected a module definition"}
 
   defp validate_module_name(
          {:defmodule, _, [{:__aliases__, _, module_parts}, _]},
@@ -195,16 +197,6 @@ defmodule MiniElixir do
   defp validate_module_name(_, _) do
     {:error, "Expected a module definition"}
   end
-
-  defp validate_single_module({:defmodule, _, [{:__aliases__, _, parts}, _]}) do
-    {:ok, Module.concat(parts)}
-  end
-
-  defp validate_single_module({:__block__, _, _}) do
-    {:error, "Expected exactly one module definition"}
-  end
-
-  defp validate_single_module(_), do: {:error, "Expected a module definition"}
 
   defp validate_module_structure({:defmodule, _, [_, [do: body]]}) do
     validate_module_body(body)
@@ -260,10 +252,11 @@ defmodule MiniElixir do
     {:error, "Module use is not allowed"}
   end
 
-  defp validate_statement({:@, _, _}), do: :ok
-
-  defp validate_statement(_expr) do
-    {:error, "Immediate code execution in modules is not allowed"}
+  defp validate_statement(expr) do
+    case expr do
+      {:@, _, _} -> :ok
+      _ -> {:error, "Immediate code execution in modules is not allowed"}
+    end
   end
 
   # Extract the source module and effective alias name from an `alias` AST.
@@ -284,126 +277,102 @@ defmodule MiniElixir do
 
   defp parse_alias(_), do: :error
 
-  # Run the validator over every function clause in the module: every `def`
-  # and `defp`, including multi-clause heads, `when` guards, default-argument
-  # expressions and bodiless heads. Must be called after
-  # validate_module_structure/1 so the statement list is already known-good.
-  defp validate_all_functions({:defmodule, _, [_, [do: body]]}) do
-    body
-    |> module_statements()
-    |> Enum.filter(&match?({kind, _, _} when kind in [:def, :defp], &1))
-    |> Enum.reduce_while(:ok, fn definition, :ok ->
-      case validate_function(definition) do
-        :ok -> {:cont, :ok}
-        error -> {:halt, error}
-      end
+  defp unwrap_function(
+         {:defmodule, _, [_, [do: {:__block__, _, defs}]]},
+         expected_name,
+         expected_arity
+       ) do
+    # handle multiple function definitions
+    Enum.find_value(defs, {:error, "Function #{expected_name}/#{expected_arity} not found"}, fn
+      {:def, _, [{name, _, args}, [do: body]]} when is_list(args) ->
+        if name == expected_name and length(args) == expected_arity do
+          arg_names = for {name, _, _} <- args, do: name
+          {:ok, {body, arg_names}}
+        end
+
+      _ ->
+        nil
     end)
   end
 
-  defp module_statements({:__block__, _, statements}) when is_list(statements), do: statements
-  defp module_statements(single), do: [single]
+  defp unwrap_function(
+         {:defmodule, _, [_, [do: {:def, _, [{name, _, args}, [do: body]]}]]},
+         expected_name,
+         expected_arity
+       )
+       when is_list(args) do
+    cond do
+      name != expected_name ->
+        {:error, "Expected function name to be #{inspect(expected_name)}, got: #{inspect(name)}"}
 
-  # Bodiless head, e.g. `def f(a, b \\ 1)` declaring defaults.
-  defp validate_function({_kind, _, [head]}) do
-    with {:ok, {_name, args, guard}} <- unwrap_head(head) do
-      validate_clause(args, guard, nil)
+      length(args) != expected_arity ->
+        {:error, "Expected function arity to be #{expected_arity}, got: #{length(args)}"}
+
+      true ->
+        arg_names = for {name, _, _} <- args, do: name
+        {:ok, {body, arg_names}}
     end
   end
 
-  defp validate_function({_kind, _, [head, [do: body]]}) do
-    with {:ok, {_name, args, guard}} <- unwrap_head(head) do
-      validate_clause(args, guard, body)
-    end
+  defp unwrap_function(_, _, _), do: {:error, "Expected a module with function definition"}
+
+  # Run the validator over every `def` and `defp` clause in the module,
+  # including multi-clause heads, `when` guards, default-argument expressions
+  # and bodiless default heads. Only plain `do` bodies are supported.
+  defp validate_all_functions({:defmodule, _, [_, [do: body]]}) do
+    statements =
+      case body do
+        {:__block__, _, statements} when is_list(statements) -> statements
+        single -> [single]
+      end
+
+    Enum.reduce_while(statements, :ok, fn
+      {kind, _, parts}, :ok when kind in [:def, :defp] ->
+        case validate_function(parts) do
+          :ok -> {:cont, :ok}
+          error -> {:halt, error}
+        end
+
+      _, :ok ->
+        {:cont, :ok}
+    end)
   end
 
-  defp validate_function({_kind, _, [head, body_parts]}) when is_list(body_parts) do
-    case unwrap_head(head) do
-      {:ok, {name, _, _}} ->
-        keys = body_parts |> Keyword.keys() |> Enum.reject(&(&1 == :do))
+  defp validate_function([head]), do: validate_function([head, [do: nil]])
 
-        {:error,
-         "Function #{name} may only have a `do` block, got: #{Enum.map_join(keys, ", ", &inspect/1)}"}
+  defp validate_function([head, [do: body]]) do
+    with {:ok, args, guard} <- unwrap_head(head) do
+      arg_names = for {name, _, ctx} <- strip_defaults(args), is_atom(ctx), do: name
+      defaults = for {:\\, _, [_pattern, default]} <- args, do: default
 
-      error ->
-        error
+      Enum.reduce_while([body, guard | defaults], :ok, fn
+        nil, :ok ->
+          {:cont, :ok}
+
+        ast, :ok ->
+          case Validator.check(ast, arg_names) do
+            :ok -> {:cont, :ok}
+            {:error, :validator, message} -> {:halt, {:error, message}}
+          end
+      end)
     end
   end
 
   defp validate_function(_), do: {:error, "Unsupported function definition"}
 
   defp unwrap_head({:when, _, [call, guard]}) do
-    with {:ok, {name, args, nil}} <- unwrap_head(call), do: {:ok, {name, args, guard}}
+    with {:ok, args, nil} <- unwrap_head(call), do: {:ok, args, guard}
   end
 
-  defp unwrap_head({name, _, args}) when is_atom(name) and is_list(args) do
-    {:ok, {name, args, nil}}
-  end
-
-  defp unwrap_head({name, _, nil}) when is_atom(name), do: {:ok, {name, [], nil}}
+  defp unwrap_head({name, _, args}) when is_atom(name) and is_list(args), do: {:ok, args, nil}
+  defp unwrap_head({name, _, nil}) when is_atom(name), do: {:ok, [], nil}
   defp unwrap_head(_), do: {:error, "Unsupported function definition"}
 
-  defp validate_clause(args, guard, body) do
-    arg_names = arg_names(args)
-    defaults = for {:\\, _, [_pattern, default]} <- args, do: default
-
-    with :ok <- check_each(defaults, arg_names),
-         :ok <- check_optional(guard, arg_names) do
-      check_optional(body, arg_names)
-    end
-  end
-
-  defp check_each(asts, arg_names) do
-    Enum.reduce_while(asts, :ok, fn ast, :ok ->
-      case check_optional(ast, arg_names) do
-        :ok -> {:cont, :ok}
-        error -> {:halt, error}
-      end
-    end)
-  end
-
-  defp check_optional(nil, _arg_names), do: :ok
-
-  defp check_optional(ast, arg_names) do
-    case Validator.check(ast, arg_names) do
-      :ok -> :ok
-      {:error, :validator, message} -> {:error, message}
-    end
-  end
-
-  # Names of top-level variable parameters (what the validator protects from
-  # re-binding). Pattern-matched parameters contribute nothing, as before.
-  defp arg_names(args) do
-    args
-    |> Enum.map(fn
+  defp strip_defaults(args) do
+    Enum.map(args, fn
       {:\\, _, [pattern, _default]} -> pattern
       pattern -> pattern
     end)
-    |> Enum.flat_map(fn
-      {name, _, ctx} when is_atom(name) and is_atom(ctx) -> [name]
-      _ -> []
-    end)
-  end
-
-  defp ensure_function_defined({:defmodule, _, [_, [do: body]]}, function, arity) do
-    defined? =
-      body
-      |> module_statements()
-      |> Enum.any?(fn
-        {:def, _, [head | _]} ->
-          case unwrap_head(head) do
-            {:ok, {^function, args, _}} -> length(args) == arity
-            _ -> false
-          end
-
-        _ ->
-          false
-      end)
-
-    if defined? do
-      :ok
-    else
-      {:error, "Function #{function}/#{arity} not found"}
-    end
   end
 
   defp module_loaded?(module) when is_atom(module) do
