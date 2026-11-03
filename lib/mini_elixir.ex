@@ -10,7 +10,7 @@ defmodule MiniElixir do
   - Restricted access to only whitelisted functions and operators
   - Protection against dangerous operations
   - Support for any module and function name
-  - Compile-only mode (`compile/2`) that validates and loads a module without running it
+  - Compile-only mode (`compile/1`) that validates and loads a module without running it
 
   ## Example
 
@@ -31,7 +31,6 @@ defmodule MiniElixir do
   alias MiniElixir.Validator
 
   @allowed_attributes [:doc, :moduledoc, :spec, :type, :typedoc]
-  @default_inner Transformer
 
   @doc """
   Evaluates a string of Elixir code in a safe sandbox environment.
@@ -119,101 +118,48 @@ defmodule MiniElixir do
 
   The source must contain exactly one top-level `defmodule`. Every `def` and
   `defp` clause in it is validated with the same rules `eval/5` applies, and
-  then the module is compiled under a caller-chosen name: the source module is
-  renamed to `inner:` and nested inside `as:`, so the resulting module is
-  `Module.concat(as, inner)`. Nothing is applied; the caller runs the compiled
-  functions later with `apply/3`.
-
-  ## Options
-
-  - `:as` (required): the outer module atom, e.g. `Transform199`
-  - `:inner` (optional, default `Transformer`): the inner module name
+  then the module is compiled and loaded under the name the source gives it.
+  Nothing is applied; the caller runs the compiled functions later with
+  `apply/3`.
 
   ## Returns
 
-  - `{:ok, module}` where `module` is `Module.concat(as, inner)`
+  - `{:ok, module}` where `module` is the name defined in the source
   - `{:error, reason}` with the same string shapes `eval/5` produces
 
   ## Examples
 
       iex> code = \"\"\"
-      ...> defmodule Transform do
+      ...> defmodule TransformDoc do
       ...>   def request(record, _metadata) do
       ...>     Map.put(record, "seen", true)
       ...>   end
       ...> end
       ...> \"\"\"
-      iex> MiniElixir.compile(code, as: TransformDoc)
-      {:ok, TransformDoc.Transformer}
-      iex> TransformDoc.Transformer.request(%{}, nil)
+      iex> MiniElixir.compile(code)
+      {:ok, TransformDoc}
+      iex> TransformDoc.request(%{}, nil)
       %{"seen" => true}
   """
-  def compile(code, opts) when is_binary(code) and is_list(opts) do
-    with {:ok, outer} <- fetch_module_opt(opts, :as, nil),
-         {:ok, inner} <- fetch_module_opt(opts, :inner, @default_inner),
-         {:ok, ast} <- parse(code),
-         :ok <- validate_single_module(ast),
+  def compile(code) when is_binary(code) do
+    with {:ok, ast} <- parse(code),
+         {:ok, module} <- validate_single_module(ast),
          :ok <- validate_module_structure(ast),
          :ok <- validate_all_functions(ast) do
-      wrapper = build_wrapper(outer, rename_module(ast, inner))
-      compile_wrapper(wrapper, Module.concat(outer, inner))
+      compile_module(ast, module)
     end
   end
 
-  defp compile_wrapper(wrapper, module) do
+  defp compile_module(ast, module) do
     try do
       Code.compiler_options(ignore_module_conflict: true)
-      Code.compile_quoted(wrapper)
+      Code.compile_quoted(ast)
       {:ok, module}
     rescue
       e -> {:error, Exception.message(e)}
     after
       Code.compiler_options(ignore_module_conflict: false)
     end
-  end
-
-  # Build `defmodule outer do <inner defmodule> end` as AST. The inner AST is
-  # spliced in as a quoted value, never re-parsed from a string.
-  defp build_wrapper(outer, inner_ast) do
-    quote do
-      defmodule unquote(module_alias(outer)) do
-        unquote(inner_ast)
-      end
-    end
-  end
-
-  # Replace the source module's name with `inner` so that, once nested in the
-  # wrapper, it becomes `outer.inner`. Only the alias node changes.
-  defp rename_module({:defmodule, meta, [{:__aliases__, _, _}, body]}, inner) do
-    {:defmodule, meta, [module_alias(inner), body]}
-  end
-
-  # An `__aliases__` node (not a bare atom) so defmodule applies nesting.
-  defp module_alias(module) do
-    parts = module |> Module.split() |> Enum.map(&String.to_atom/1)
-    {:__aliases__, [alias: false], parts}
-  end
-
-  defp fetch_module_opt(opts, key, default) do
-    case Keyword.get(opts, key, default) do
-      nil ->
-        {:error, "Option #{inspect(key)} is required"}
-
-      module when is_atom(module) ->
-        if elixir_module_atom?(module) do
-          {:ok, module}
-        else
-          {:error,
-           "Option #{inspect(key)} must be an Elixir module atom, got: #{inspect(module)}"}
-        end
-
-      other ->
-        {:error, "Option #{inspect(key)} must be an Elixir module atom, got: #{inspect(other)}"}
-    end
-  end
-
-  defp elixir_module_atom?(module) do
-    String.starts_with?(Atom.to_string(module), "Elixir.")
   end
 
   defp parse(code) do
@@ -252,7 +198,9 @@ defmodule MiniElixir do
     {:error, "Expected a module definition"}
   end
 
-  defp validate_single_module({:defmodule, _, [{:__aliases__, _, _}, _]}), do: :ok
+  defp validate_single_module({:defmodule, _, [{:__aliases__, _, parts}, _]}) do
+    {:ok, Module.concat(parts)}
+  end
 
   defp validate_single_module({:__block__, _, _}) do
     {:error, "Expected exactly one module definition"}
