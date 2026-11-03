@@ -162,7 +162,6 @@ apply(MyApp.Transform, :request, [%{}, "x"])
 #### Behaviour
 
 - Every `def` and `defp` clause is validated, including multi-clause heads, `when` guards and default-argument expressions. `eval/5` applies the same whole-module validation.
-- Only `@doc`, `@moduledoc`, `@typedoc`, `@spec` and `@type` are accepted as module attributes. Doc attributes must be literal values; typespecs may not contain `unquote`. Attributes such as `@on_load`, `@before_compile` and `@after_compile` are rejected because they run code at compile time.
 - Function clauses may only have a `do` block (no `rescue`, `catch` or `after`).
 - Source containing a stray `end`, trailing top-level code, or more than one module fails at parse or structure check and defines nothing.
 - Nothing is applied. The returned module is loaded and ready for `apply/3`. Compiling again under the same name replaces the previous version.

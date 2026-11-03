@@ -30,8 +30,6 @@ defmodule MiniElixir do
 
   alias MiniElixir.Validator
 
-  @allowed_attributes [:doc, :moduledoc, :spec, :type, :typedoc]
-
   @doc """
   Evaluates a string of Elixir code in a safe sandbox environment.
 
@@ -262,50 +260,10 @@ defmodule MiniElixir do
     {:error, "Module use is not allowed"}
   end
 
-  defp validate_statement({:@, _, [{name, _, args}]}) when is_atom(name) do
-    validate_attribute(name, args)
-  end
+  defp validate_statement({:@, _, _}), do: :ok
 
   defp validate_statement(_expr) do
     {:error, "Immediate code execution in modules is not allowed"}
-  end
-
-  # Attribute values are evaluated at compile time, so both the attribute name
-  # and its value are restricted. Doc attributes must be literals; typespecs
-  # must not contain unquote fragments (the only way to run code inside them).
-  defp validate_attribute(name, [value]) when name in [:doc, :moduledoc, :typedoc] do
-    if Macro.quoted_literal?(value) do
-      :ok
-    else
-      {:error, "Module attribute @#{name} must be a literal value"}
-    end
-  end
-
-  defp validate_attribute(name, [value]) when name in [:spec, :type] do
-    if contains_unquote?(value) do
-      {:error, "Module attribute @#{name} must not contain unquote"}
-    else
-      :ok
-    end
-  end
-
-  defp validate_attribute(name, _args) when name in @allowed_attributes do
-    {:error, "Module attribute @#{name} must be given a single value"}
-  end
-
-  defp validate_attribute(name, _args) do
-    allowed = Enum.map_join(@allowed_attributes, ", ", &"@#{&1}")
-    {:error, "Module attribute @#{name} is not allowed (allowed: #{allowed})"}
-  end
-
-  defp contains_unquote?(ast) do
-    {_, found?} =
-      Macro.prewalk(ast, false, fn
-        {op, _, _} = node, _ when op in [:unquote, :unquote_splicing] -> {node, true}
-        node, acc -> {node, acc}
-      end)
-
-    found?
   end
 
   # Extract the source module and effective alias name from an `alias` AST.

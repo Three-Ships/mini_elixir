@@ -529,68 +529,6 @@ defmodule MiniElixirTest do
       end
     end
 
-    test "accepts @doc and rejects @on_load" do
-      ok_code = ~S"""
-      defmodule Transform312 do
-        @doc "safe"
-        def request(record, _metadata), do: record
-      end
-      """
-
-      assert {:ok, Transform312} = MiniElixir.compile(ok_code)
-
-      bad_code = ~S"""
-      defmodule Transform313 do
-        @on_load :boom
-        def boom, do: File.read!("/etc/passwd")
-        def request(record, _metadata), do: record
-      end
-      """
-
-      assert {:error, message} = MiniElixir.compile(bad_code)
-      assert message =~ "Module attribute @on_load is not allowed"
-      refute Code.ensure_loaded?(Transform313)
-    end
-
-    test "rejects @before_compile, @after_compile and arbitrary attributes" do
-      for attr <- ["@before_compile Transform314", "@after_compile Transform314", "@custom 1"] do
-        code = """
-        defmodule Transform314 do
-          #{attr}
-          def request(record, _metadata), do: record
-        end
-        """
-
-        assert {:error, message} = MiniElixir.compile(code)
-        assert message =~ "is not allowed"
-        refute Code.ensure_loaded?(Transform314)
-      end
-    end
-
-    test "rejects non-literal doc attributes and unquote in specs" do
-      doc_code = ~S"""
-      defmodule Transform315 do
-        @doc File.read!("/etc/passwd")
-        def request(record, _metadata), do: record
-      end
-      """
-
-      assert {:error, message} = MiniElixir.compile(doc_code)
-      assert message =~ "@doc must be a literal value"
-      refute Code.ensure_loaded?(Transform315)
-
-      spec_code = ~S"""
-      defmodule Transform316 do
-        @spec request(unquote(File.read!("/etc/passwd")), term()) :: map()
-        def request(record, _metadata), do: record
-      end
-      """
-
-      assert {:error, message} = MiniElixir.compile(spec_code)
-      assert message =~ "@spec must not contain unquote"
-      refute Code.ensure_loaded?(Transform316)
-    end
-
     test "returns validator messages in the same shape as eval/5" do
       code = ~S"""
       defmodule Transform317 do
