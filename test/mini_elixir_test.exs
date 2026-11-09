@@ -248,6 +248,278 @@ defmodule MiniElixirTest do
     end
   end
 
+  describe "compile/1" do
+    setup do
+      previous = Application.get_env(:mini_elixir, :allowed_modules)
+      Application.delete_env(:mini_elixir, :allowed_modules)
+
+      on_exit(fn ->
+        if previous do
+          Application.put_env(:mini_elixir, :allowed_modules, previous)
+        else
+          Application.delete_env(:mini_elixir, :allowed_modules)
+        end
+      end)
+
+      :ok
+    end
+
+    @valid_transform ~S"""
+    defmodule Transform199.Transformer do
+      @moduledoc "Adds a tag"
+      @doc "Request handler"
+      @spec request(map(), term()) :: map()
+      def request(record, metadata) do
+        tag(record, metadata)
+      end
+
+      def version, do: 1
+
+      defp tag(record, nil), do: Map.put(record, "tag", "none")
+      defp tag(record, metadata) when is_binary(metadata), do: Map.put(record, "tag", metadata)
+      defp tag(record, _metadata), do: record
+    end
+    """
+
+    test "compiles a valid module and loads it without running it" do
+      assert {:ok, Transform199.Transformer} = MiniElixir.compile(@valid_transform)
+      assert Code.ensure_loaded?(Transform199.Transformer)
+
+      functions = Transform199.Transformer.__info__(:functions)
+      assert {:request, 2} in functions
+      assert {:version, 0} in functions
+      refute {:tag, 2} in functions
+
+      assert apply(Transform199.Transformer, :request, [%{"a" => 1}, "x"]) ==
+               %{"a" => 1, "tag" => "x"}
+
+      assert apply(Transform199.Transformer, :request, [%{}, nil]) == %{"tag" => "none"}
+    end
+
+    test "returns the module name exactly as written in the source" do
+      code = ~S"""
+      defmodule Some.Deeply.Nested.Name do
+        def request(record, _metadata), do: record
+      end
+      """
+
+      assert {:ok, Some.Deeply.Nested.Name} = MiniElixir.compile(code)
+      assert Code.ensure_loaded?(Some.Deeply.Nested.Name)
+    end
+
+    test "rejects a forbidden call in a defp before compiling" do
+      code = ~S"""
+      defmodule Transform300 do
+        def request(path, _metadata), do: read(path)
+        defp read(path), do: File.read!(path)
+      end
+      """
+
+      assert {:error, message} = MiniElixir.compile(code)
+      assert message =~ "Forbidden function: Elixir.File.read!"
+      refute Code.ensure_loaded?(Transform300)
+    end
+
+    test "rejects a forbidden call in a second def" do
+      code = ~S"""
+      defmodule Transform301 do
+        def request(record, _metadata), do: record
+        def leak(path), do: File.read!(path)
+      end
+      """
+
+      assert {:error, message} = MiniElixir.compile(code)
+      assert message =~ "Forbidden function"
+      refute Code.ensure_loaded?(Transform301)
+    end
+
+    test "rejects a forbidden call in a guarded clause" do
+      code = ~S"""
+      defmodule Transform302 do
+        def request(record, _metadata) when is_map(record), do: record
+        def request(path, _metadata) when is_binary(path), do: File.read!(path)
+      end
+      """
+
+      assert {:error, message} = MiniElixir.compile(code)
+      assert message =~ "Forbidden function"
+      refute Code.ensure_loaded?(Transform302)
+    end
+
+    test "rejects a forbidden call in a guard expression" do
+      code = ~S"""
+      defmodule Transform303 do
+        def request(record, _metadata) when File.exists?("/etc/passwd"), do: record
+      end
+      """
+
+      assert {:error, message} = MiniElixir.compile(code)
+      assert message =~ "Forbidden function"
+      refute Code.ensure_loaded?(Transform303)
+    end
+
+    test "rejects a forbidden call in a default-argument expression" do
+      code = ~S"""
+      defmodule Transform304 do
+        def request(record, metadata \\ File.read!("/etc/passwd")) do
+          {record, metadata}
+        end
+      end
+      """
+
+      assert {:error, message} = MiniElixir.compile(code)
+      assert message =~ "Forbidden function"
+      refute Code.ensure_loaded?(Transform304)
+    end
+
+    test "rejects a forbidden call in a bodiless default head" do
+      code = ~S"""
+      defmodule Transform305 do
+        def request(record, metadata \\ System.get_env("HOME"))
+        def request(record, nil), do: record
+        def request(record, metadata), do: Map.put(record, "m", metadata)
+      end
+      """
+
+      assert {:error, message} = MiniElixir.compile(code)
+      assert message =~ "Forbidden function"
+      refute Code.ensure_loaded?(Transform305)
+    end
+
+    test "accepts safe multi-clause, guarded and default-argument definitions" do
+      code = ~S"""
+      defmodule Transform306 do
+        def request(record, metadata \\ "default")
+        def request(record, nil), do: record
+        def request(record, metadata) when is_binary(metadata), do: Map.put(record, "m", metadata)
+        def request(record, _metadata), do: record
+      end
+      """
+
+      assert {:ok, Transform306} = MiniElixir.compile(code)
+      assert Transform306.request(%{}) == %{"m" => "default"}
+      assert Transform306.request(%{}, nil) == %{}
+      assert Transform306.request(%{}, 7) == %{}
+    end
+
+    test "rejects function clauses with rescue blocks" do
+      code = ~S"""
+      defmodule Transform307 do
+        def request(record, _metadata) do
+          record
+        rescue
+          _ -> File.read!("/etc/passwd")
+        end
+      end
+      """
+
+      assert {:error, message} = MiniElixir.compile(code)
+      assert message == "Unsupported function definition"
+      refute Code.ensure_loaded?(Transform307)
+    end
+
+    test "stray end followed by top-level code fails at parse and defines no module" do
+      code = ~S"""
+      defmodule Transform308 do
+        def request(record, _metadata), do: record
+      end
+      end
+      IO.puts("escaped")
+      """
+
+      assert {:error, message} = MiniElixir.compile(code)
+      assert message =~ ~r/^Line \d+: /
+      refute Code.ensure_loaded?(Transform308)
+    end
+
+    test "top-level code after the module fails the structure check" do
+      code = ~S"""
+      defmodule Transform309 do
+        def request(record, _metadata), do: record
+      end
+
+      IO.puts("escaped")
+      """
+
+      assert {:error, "Expected exactly one module definition"} = MiniElixir.compile(code)
+      refute Code.ensure_loaded?(Transform309)
+    end
+
+    test "two modules in one source are rejected" do
+      code = ~S"""
+      defmodule Transform310 do
+        def request(record, _metadata), do: record
+      end
+
+      defmodule Transform310Other do
+        def go, do: System.cmd("rm", ["-rf", "/"])
+      end
+      """
+
+      assert {:error, "Expected exactly one module definition"} = MiniElixir.compile(code)
+      refute Code.ensure_loaded?(Transform310)
+      refute Code.ensure_loaded?(Transform310Other)
+    end
+
+    test "source without a module is rejected" do
+      assert {:error, "Expected a module definition"} = MiniElixir.compile("1 + 1")
+      assert {:error, "Expected a module definition"} = MiniElixir.compile(~s|IO.puts("hi")|)
+    end
+
+    test "nested modules, import, require, use and bare expressions are rejected" do
+      for {snippet, expected} <- [
+            {"defmodule Inner do\n end", "Nested modules are not allowed"},
+            {"import Enum", "Module imports are not allowed"},
+            {"require Logger", "Module requires are not allowed"},
+            {"use GenServer", "Module use is not allowed"},
+            {~s|IO.puts("hi")|, "Immediate code execution in modules is not allowed"}
+          ] do
+        code = """
+        defmodule Transform311 do
+          #{snippet}
+          def request(record, _metadata), do: record
+        end
+        """
+
+        assert {:error, ^expected} = MiniElixir.compile(code)
+        refute Code.ensure_loaded?(Transform311)
+      end
+    end
+
+    test "returns validator messages as plain strings" do
+      code = ~S"""
+      defmodule Transform317 do
+        def request(record, _metadata) do
+          record = Map.put(record, "x", 1)
+          record
+        end
+      end
+      """
+
+      assert {:error, message} = MiniElixir.compile(code)
+      assert message == "can't assign to argument: record"
+    end
+
+    test "recompiling the same module name replaces it" do
+      v1 = ~S"""
+      defmodule Transform318 do
+        def version, do: 1
+      end
+      """
+
+      v2 = ~S"""
+      defmodule Transform318 do
+        def version, do: 2
+      end
+      """
+
+      assert {:ok, Transform318} = MiniElixir.compile(v1)
+      assert Transform318.version() == 1
+      assert {:ok, Transform318} = MiniElixir.compile(v2)
+      assert Transform318.version() == 2
+    end
+  end
+
   describe "allowed_modules configuration" do
     setup do
       # Clean up any previous config
