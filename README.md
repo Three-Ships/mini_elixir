@@ -132,7 +132,7 @@ MiniElixir.eval(code, module, function, args, opts \\ [persistent: true]) :: {:o
 
 ### `MiniElixir.compile/1`
 
-Validates and compiles a module without executing any of it. Use this when you want to compile once and call the functions later with `apply/3`, rather than compiling and running in one step. The module is loaded under the name the source gives it; MiniElixir does not rename or wrap it.
+Checks the module shape and compiles a module without executing any of it. Use this when you want to compile once and call the functions later with `apply/3`, rather than compiling and running in one step. The module is loaded under the name the source gives it; MiniElixir does not rename or wrap it.
 
 ```elixir
 MiniElixir.compile(code) :: {:ok, module} | {:error, reason}
@@ -161,14 +161,14 @@ apply(MyApp.Transform, :request, [%{}, "x"])
 
 #### Behaviour
 
-- Every `def` and `defp` clause is validated with the same rules `eval/5` applies to the function it runs, including multi-clause heads, `when` guards and default-argument expressions. Function clauses may only have a `do` block (no `rescue`, `catch` or `after`).
+- Function bodies are not validated; `def` clauses may use `rescue`, `catch` and `after`. Only the module shape is checked.
 - Source containing a stray `end`, trailing top-level code, or more than one module fails at parse or structure check and defines nothing.
 - Nothing is applied. The returned module is loaded and ready for `apply/3`. Compiling again under the same name replaces the previous version.
 
 #### Returns
 
 - `{:ok, module}` where `module` is the name defined in the source
-- `{:error, reason}` where `reason` is a string: `"Line N: ..."` for parse errors, validator or structure messages otherwise
+- `{:error, reason}` where `reason` is a string: `"Line N: ..."` for parse errors, structure messages otherwise
 
 ## Allowed vs Disallowed
 
